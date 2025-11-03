@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import torch
+import time
 from ultralytics import YOLO
 
 video_path = r"/Users/tit/Documents/deeplearning/Screen Recording 2025-10-06 221557.mp4"
@@ -11,8 +12,10 @@ assert cap.isOpened(), "Error reading video file"
 # region_points = [[185, 148], [300, 150], [312, 631], [196, 631]]  # rectangle region
 region_points = [[120, 174], [693, 220], [688, 267], [688, 267], [114, 220]]   # polygon region
 poly_cnt = np.array(region_points, dtype=np.int32).reshape((-1, 1, 2))
+poly_min_x = min(p[0] for p in region_points)
 poly_max_x = max(p[0] for p in region_points)
-EXIT_MARGIN = 6  # đối tượng vượt quá cạnh phải của polygon + margin => OUT
+EXIT_MARGIN = 10
+LOST_TTL    = 5 
 
 # Video writer
 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -23,27 +26,37 @@ video_writer = cv2.VideoWriter("object_counting_output.avi",
                                cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
 # Model
-model = YOLO("yolo_apple_finetune.pt")  # đổi sang đường dẫn checkpoint của bạn
-
-# GUI
-win_name = "Apple Counter (Polygon Zone)"
-cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-cv2.resizeWindow(win_name, min(1280, w), min(720, h))
-
-# Tracking states & counters
-states = {}  # id -> {"inside": False, "in_done": False, "out_done": False}
-in_count = 0
-out_count = 0
+model = YOLO("yolo_apple_finetune.pt")  # load a pretrained YOLOv8n detection model
 
 # Helpers
-def point_in_poly(cx, cy):
-    return cv2.pointPolygonTest(poly_cnt, (int(cx), int(cy)), False) >= 0
-
 def draw_zone(frame):
     overlay = frame.copy()
     cv2.fillPoly(overlay, [poly_cnt], (0, 255, 255))
     cv2.addWeighted(overlay, 0.20, frame, 0.80, 0, frame)
-    cv2.polylines(frame, [poly_cnt], True, (0, 255, 255), 2)
+    cv2.polylines(frame, [poly_cnt], isClosed=True, color=(0, 255, 255), thickness=2)
+
+def inside_polygon(cx, cy):
+    return cv2.pointPolygonTest(poly_cnt, (int(cx), int(cy)), False) >= 0
+
+def put_hud(frame, in_cnt, out_cnt):
+    # background strip to avoid overlap with any upstream drawings
+    cv2.rectangle(frame, (0, 0), (w, 60), (0, 0, 0), -1)
+    cv2.putText(frame, f"IN: {in_cnt}", (18, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+    cv2.putText(frame, f"OUT: {out_cnt}", (220, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+    
+# Tracking states
+# id -> dict(in_done, inside, out_done, last_cx, last_seen, prev_inside)
+states = {}
+in_count  = 0
+out_count = 0
+frame_idx = 0
+
+# GUI
+win = "Apple Counter (Polygon Zone)"
+cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(win, min(1280, w), min(720, h))
 
 # Device selection
 try:
@@ -53,6 +66,7 @@ except Exception:
 print(f"Using device: {chosen_device}")
 
 # Process with YOLO tracking
+t0 = time.time()
 for res in model.track(
     source=video_path,
     stream=True,
@@ -62,74 +76,105 @@ for res in model.track(
     conf=0.25,
     iou=0.7,
     device=chosen_device,
-    classes=[0]                 # If dataset has many classes and "apple" is class 0; remove if only 1 class
+    verbose=False
 ):
-    frame = res.orig_img.copy()
-
-    # Draw polygon zone
+    frame = res.orig_img.copy()  # BGR
     draw_zone(frame)
 
-    # Tracking
-    if res.boxes is not None and len(res.boxes) > 0:
-        xyxy = res.boxes.xyxy.cpu().numpy().astype(int)        # [N,4]
-        ids  = res.boxes.id
-        ids  = ids.cpu().numpy().astype(int) if ids is not None else np.array([None]*len(xyxy))
+    # Collect detections
+    boxes = res.boxes
+    if boxes is not None and len(boxes) > 0:
+        xyxy = boxes.xyxy.cpu().numpy().astype(int)
+        ids  = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else np.array([-1]*len(xyxy))
+        clss = boxes.cls.cpu().numpy().astype(int) if boxes.cls is not None else np.zeros(len(xyxy), int)
+        conf = boxes.conf.cpu().numpy() if boxes.conf is not None else np.ones(len(xyxy))
+    else:
+        xyxy, ids, clss, conf = [], [], [], []
 
-        for (x1, y1, x2, y2), oid in zip(xyxy, ids):
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            inside = point_in_poly(cx, cy)
+    # Update per detection
+    for (x1, y1, x2, y2), oid, c, s in zip(xyxy, ids, clss, conf):
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        is_in  = inside_polygon(cx, cy)
 
-            # Init state
-            st = states.get(oid, {"inside": False, "in_done": False, "out_done": False})
+        st = states.get(oid, {"in_done": False, "inside": False, "out_done": False,
+                              "last_cx": cx, "last_seen": frame_idx, "prev_inside": False,
+                              "entered_from_left": False})
 
-            # 1. Increase IN if object enters the zone
-            if inside and not st["in_done"]:
-                in_count += 1
-                st["in_done"] = True
-                st["inside"] = True
+        # Check if entering from left side
+        if not st["in_done"] and cx < poly_min_x:
+            st["entered_from_left"] = True
 
-            # 2. Object is already inside the zone
-            elif inside and st["in_done"]:
-                st["inside"] = True
+        # IN: first time center enters polygon
+        if is_in and not st["in_done"]:
+            in_count += 1
+            st["in_done"] = True
 
-            # 3. Increase OUT if object exits the zone
-            elif (not inside) and st["inside"] and (cx > poly_max_x + EXIT_MARGIN) and (not st["out_done"]):
+        # OUT: when the tracked center exits to the right, after having been inside and entered from left
+        if (not is_in) and st["in_done"] and (not st["out_done"]) and st["entered_from_left"] and (cx > poly_max_x + EXIT_MARGIN):
+            out_count += 1
+            st["out_done"] = True
+
+        # Update state
+        st["inside"]      = is_in
+        st["prev_inside"] = st.get("prev_inside", False) or is_in
+        st["last_cx"]     = cx
+        st["last_seen"]   = frame_idx
+        states[oid]       = st
+
+        # DRAW ONLY if inside polygon
+        if is_in:
+            # label text: class name + confidence
+            try:
+                name = model.names[int(c)]
+            except Exception:
+                name = "apple"
+            label = f"{name} {s:.2f}"
+
+            # bbox
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+
+            # label bg
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), (0, 200, 0), -1)
+            cv2.putText(frame, label, (x1 + 2, y1 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+            # center dot
+            cv2.circle(frame, (cx, cy), 3, (255, 0, 0), -1)
+
+    # Handle tracks that disappear right after leaving the zone to the right
+    # (no detection this frame). If last_seen is older than LOST_TTL and last cx
+    # was already beyond polygon's right edge, count OUT once if entered from left.
+    to_mark = []
+    for oid, st in states.items():
+        if st["in_done"] and (not st["out_done"]) and st["entered_from_left"]:
+            if frame_idx - st["last_seen"] > LOST_TTL and st["last_cx"] > poly_max_x + EXIT_MARGIN:
                 out_count += 1
-                st["inside"] = False
                 st["out_done"] = True
-            else:
-                st["inside"] = inside
-
-            states[oid] = st
-
-            # Draw bounding boxes if object inside polygon zone
-            if inside:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
-                if oid is not None:
-                    cv2.putText(frame, f"ID {oid}", (x1, y1 - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
-                # bbox center
-                cv2.circle(frame, (cx, cy), 3, (255, 0, 0), -1)
+                to_mark.append(oid)
+    # (optional) clean-up old tracks to keep dict small
+    for oid in to_mark:
+        states[oid] = st
 
     # HUD
-    cv2.putText(frame, f"IN: {in_count}", (18, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-    cv2.putText(frame, f"OUT: {out_count}", (180, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+    put_hud(frame, in_count, out_count)
 
-    # Save + show
     video_writer.write(frame)
-    cv2.imshow(win_name, frame)
-    k = cv2.waitKey(1) & 0xFF
-    if k in (27, ord('q')):  # Press 'ESC' or 'q' to quit
+    cv2.imshow(win, frame)
+    key = cv2.waitKey(1) & 0xFF
+    if key in (27, ord('q')):
         break
-    if k == ord(' '):        # Space: pause/resume
+    if key == ord(' '):
         while True:
             k2 = cv2.waitKey(0) & 0xFF
-            if k2 in (ord(' '), 27, ord('q')):
+            if k2 in (27, ord('q'), ord(' ')):
                 break
         if k2 in (27, ord('q')):
             break
 
+    frame_idx += 1
+
 video_writer.release()
 cv2.destroyAllWindows()
+dur = time.time() - t0
+print(f"[DONE] Saved object_counting_output.avi | IN={in_count} OUT={out_count} | fps~{frame_idx/max(dur,1e-6):.2f}")
