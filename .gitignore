@@ -1,1 +1,4 @@
 /apple-detection-1
+/runs
+/plots
+*.pt
