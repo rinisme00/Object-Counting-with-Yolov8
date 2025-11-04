@@ -1,0 +1,7 @@
+ultralytics
+opencv-python
+numpy
+pandas
+matplotlib
+comet-ml # For logging
+roboflow # For downloading dataset
