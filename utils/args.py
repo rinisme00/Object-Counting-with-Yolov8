@@ -17,7 +17,7 @@ def get_train_settings():
         imgsz=640,
         batch=16,           # int, -1 (auto ~60% VRAM), or 0.xx (fraction)
         data=None,          # set in CLI
-        model=None,         # set in CLI (we pass YOLOv8 .pt in train_yolov8_auto.py)
+        model=None,         # set in CLI (we pass yolo11n.pt in train.py)
         device=None,        # auto in main
         workers=8,
         patience=100,
